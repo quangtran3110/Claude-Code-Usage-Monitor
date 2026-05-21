@@ -807,13 +807,13 @@ fn set_startup_enabled(enable: bool) {
 const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
+const SEGMENT_COUNT: i32 = 5;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
-const LABEL_RIGHT_MARGIN: i32 = 10;
+const LABEL_RIGHT_MARGIN: i32 = 4;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 130;
 const MODEL_RIGHT_MARGIN: i32 = 5;
