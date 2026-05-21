@@ -1145,10 +1145,8 @@ fn short_weekday_name(weekday: u32) -> &'static str {
 /// Positive when local is ahead of UTC (east of UTC), negative when behind.
 fn local_offset_seconds() -> i64 {
     unsafe {
-        let mut local = SYSTEMTIME::default();
-        let mut utc = SYSTEMTIME::default();
-        GetLocalTime(&mut local);
-        GetSystemTime(&mut utc);
+        let local = GetLocalTime();
+        let utc = GetSystemTime();
         systemtime_to_unix(&local) - systemtime_to_unix(&utc)
     }
 }
