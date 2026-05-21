@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
+use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 
 use crate::diagnose;
 use crate::localization::Strings;
@@ -1020,7 +1022,9 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
+/// Format a usage section as "X% · 4:30 - 23:15" style text.
+/// Shows remaining time as H:MM (or "Xd Yh" for >= 1 day) and appends the
+/// localized clock time when the rate limit will reset.
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
     let cd = format_countdown(section.resets_at, strings);
@@ -1042,48 +1046,178 @@ fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
         Err(_) => return strings.now.to_string(),
     };
 
-    format_countdown_from_secs(remaining.as_secs(), strings)
+    let countdown = format_countdown_from_secs(remaining.as_secs(), strings);
+    let clock = format_reset_clock(reset);
+    if clock.is_empty() {
+        countdown
+    } else {
+        format!("{countdown} - {clock}")
+    }
 }
 
-/// Calculate how long until the display text would change
+/// Calculate how long until the display text would change.
+/// Because we now display minute-level precision, refresh once per minute.
 pub fn time_until_display_change(resets_at: Option<SystemTime>) -> Option<Duration> {
     let reset = resets_at?;
     let remaining = reset.duration_since(SystemTime::now()).ok()?;
     Some(time_until_display_change_from_secs(remaining.as_secs()))
 }
 
-fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
+fn format_countdown_from_secs(total_secs: u64, _strings: Strings) -> String {
     let total_mins = total_secs / 60;
     let total_hours = total_secs / 3600;
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        // For >= 1 day: show "Xd Yh" (e.g. "1d 5h")
+        let remainder_hours = (total_secs % 86400) / 3600;
+        format!("{total_days}d {remainder_hours}h")
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        // For >= 1 hour: show "H:MM" (e.g. "4:30")
+        let remainder_mins = (total_secs % 3600) / 60;
+        format!("{total_hours}:{remainder_mins:02}")
     } else if total_mins >= 1 {
-        format!("{total_mins}{}", strings.minute_suffix)
+        // For < 1 hour: show "0:MM"
+        format!("0:{total_mins:02}")
     } else {
-        format!("{total_secs}{}", strings.second_suffix)
+        // Less than a minute remaining
+        format!("0:00")
     }
 }
 
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
-    let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
+    // We now display minute-level precision, so refresh roughly every minute.
+    let remainder = total_secs % 60;
+    // If we're already at the start of a minute, refresh in 60s; otherwise
+    // wait the remainder until we cross into the next minute (plus a tiny
+    // cushion so we don't tick early).
+    let wait = if remainder == 0 { 60 } else { remainder };
+    Duration::from_secs(wait + 1)
+}
 
-    let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
-        total_hours * 3600
-    } else if total_mins >= 1 {
-        total_mins * 60
-    } else {
-        total_secs
+/// Format the reset time as a local clock time, prefixed with a short
+/// weekday name (Mon/Tue/...) when the reset doesn't fall on today's date.
+fn format_reset_clock(reset: SystemTime) -> String {
+    let reset_secs = match reset.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return String::new(),
     };
 
-    Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
+    let offset = local_offset_seconds();
+    let local_reset_secs = reset_secs + offset;
+    if local_reset_secs < 0 {
+        return String::new();
+    }
+
+    let (_, _, _, weekday, hour, min) = unix_to_components(local_reset_secs as u64);
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let local_now_secs = (now_secs + offset).max(0) as u64;
+
+    let reset_day = (local_reset_secs as u64) / 86400;
+    let today_day = local_now_secs / 86400;
+
+    if reset_day == today_day {
+        format!("{hour:02}:{min:02}")
+    } else {
+        format!("{} {hour:02}:{min:02}", short_weekday_name(weekday))
+    }
+}
+
+fn short_weekday_name(weekday: u32) -> &'static str {
+    // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+    match weekday {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        _ => "",
+    }
+}
+
+/// Offset (in seconds) from UTC to the user's local time.
+/// Positive when local is ahead of UTC (east of UTC), negative when behind.
+fn local_offset_seconds() -> i64 {
+    unsafe {
+        let mut local = SYSTEMTIME::default();
+        let mut utc = SYSTEMTIME::default();
+        GetLocalTime(&mut local);
+        GetSystemTime(&mut utc);
+        systemtime_to_unix(&local) - systemtime_to_unix(&utc)
+    }
+}
+
+fn systemtime_to_unix(st: &SYSTEMTIME) -> i64 {
+    let year = st.wYear as u64;
+    let month = st.wMonth as u64;
+    let day = st.wDay as u64;
+    let hour = st.wHour as u64;
+    let min = st.wMinute as u64;
+    let sec = st.wSecond as u64;
+
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+
+    let month_days = [0u64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += month_days[m as usize];
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += day.saturating_sub(1);
+
+    (days * 86400 + hour * 3600 + min * 60 + sec) as i64
+}
+
+/// Convert a unix timestamp (in seconds, treated as a local-time value when
+/// passed an offset-adjusted value) into (year, month, day, weekday, hour, minute).
+/// Weekday: 0 = Sunday, 1 = Monday, ..., 6 = Saturday.
+fn unix_to_components(total_secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = total_secs / 86400;
+    let secs_in_day = total_secs % 86400;
+
+    let hour = (secs_in_day / 3600) as u32;
+    let min = ((secs_in_day % 3600) / 60) as u32;
+
+    // 1970-01-01 was a Thursday (weekday 4).
+    let weekday = ((days + 4) % 7) as u32;
+
+    let mut year: u64 = 1970;
+    let mut remaining_days = days;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days = [0u64, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month: u64 = 1;
+    while month <= 12 {
+        let mut dim = month_days[month as usize];
+        if month == 2 && is_leap(year) {
+            dim += 1;
+        }
+        if remaining_days < dim {
+            break;
+        }
+        remaining_days -= dim;
+        month += 1;
+    }
+    let day = remaining_days + 1;
+
+    (year as u32, month as u32, day as u32, weekday, hour, min)
 }
 
 /// Returns true if either section has reached "now" (reset time has passed).
